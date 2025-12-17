@@ -1,0 +1,34 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# CUDA / NVCC intermediates
+*.ptx
+*.cubin
+*.fatbin
+*.linkinfo
+*_dc.o
+*_dlink.o
+
+# Binaries produced by this repo
+bench0
+exp0
+exp1
+exp_a_pingpong
+exp_b_throughput
+exp_c_graph_bfs
+test_allocator
+
+# Output data/plots
+*.csv
+*.png
+
+# Editor/OS noise
+.DS_Store
+*.swp
+*.swo
+*~
+

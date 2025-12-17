@@ -104,6 +104,7 @@ void run_baseline_bfs(Graph graph, int source, BFSResult result) {
     auto end = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(end - start).count();
     
+    // Note: "level" is the number of BFS iterations (frontier expansions), i.e., number of kernel launches.
     printf("Baseline_BFS,%d,%d,%.3f,%d\n", graph.num_nodes, graph.num_edges, ms, level);
     
     cudaFree(d_frontier);
@@ -128,9 +129,11 @@ __global__ void grosr_bfs_runtime(TaskQueue* q, Graph graph, BFSResult result,
         // Process BFS task
         int node = task.node_id;
         
-        // Check if already visited (with atomic to handle race conditions)
+        // Visited state machine:
+        // 0 = unvisited, 2 = enqueued, 1 = processed.
+        // If we dequeue a node that was marked "enqueued" (2), we MUST still process it.
         int old_visited = atomicExch(&result.visited[node], 1);
-        if (old_visited) continue; // Already processed
+        if (old_visited == 1) continue; // Already processed
         
         result.distances[node] = task.level;
         result.parents[node] = task.parent;
@@ -157,15 +160,16 @@ __global__ void grosr_bfs_runtime(TaskQueue* q, Graph graph, BFSResult result,
                 neighbor_task.parent = node;
                 
                 // Push to queue (simple version - wait for space)
-                while (*q->head - *q->tail >= q->capacity) {
+                while (atomicAdd_system(q->head, 0) - atomicAdd_system(q->tail, 0) >= q->capacity) {
                     __nanosleep(100);
                 }
                 
-                int slot = (*q->head) % q->capacity;
+                int head = atomicAdd_system(q->head, 0);
+                int slot = head % q->capacity;
                 BFSTask* task_ptr = (BFSTask*)((char*)q->tasks + (slot * q->task_size));
                 *task_ptr = neighbor_task;
                 __threadfence_system();
-                atomicAdd(q->head, 1);
+                atomicAdd_system(q->head, 1);
             }
         }
         
@@ -176,7 +180,11 @@ __global__ void grosr_bfs_runtime(TaskQueue* q, Graph graph, BFSResult result,
 void run_grosr_bfs(Graph graph, int source, BFSResult result) {
     TaskQueue* q;
     CUDA_CHECK(cudaMallocManaged(&q, sizeof(TaskQueue)));
-    init_task_queue(q, 16384, sizeof(BFSTask)); // Larger queue for BFS
+    // Ensure capacity is large enough to avoid producer/consumer deadlock in this single-thread runtime.
+    // Each node is enqueued at most once (CAS 0->2), so pending tasks <= num_nodes.
+    int capacity = graph.num_nodes + 64;
+    if (capacity < 1024) capacity = 1024;
+    init_task_queue(q, capacity, sizeof(BFSTask));
     
     volatile int* stop_flag;
     CUDA_CHECK(cudaMallocManaged((int**)&stop_flag, sizeof(int)));
@@ -192,7 +200,7 @@ void run_grosr_bfs(Graph graph, int source, BFSResult result) {
     
     // Warmup
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    cudaDeviceSynchronize();
+    // IMPORTANT: Do not call cudaDeviceSynchronize() here; the runtime kernel is persistent.
     
     auto start = std::chrono::high_resolution_clock::now();
     
@@ -227,6 +235,7 @@ void run_grosr_bfs(Graph graph, int source, BFSResult result) {
     auto end = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(end - start).count();
     
+    // Note: last field is nodes processed (tasks executed), not BFS levels.
     printf("GROSR_BFS,%d,%d,%.3f,%d\n", graph.num_nodes, graph.num_edges, ms, *d_tasks_processed);
     
     // Cleanup
@@ -286,6 +295,47 @@ Graph generate_random_graph(int num_nodes, float edge_probability) {
     return graph;
 }
 
+// Generate a simple chain graph: 0-1-2-...-(n-1) (undirected).
+// This creates a high number of BFS levels (~n), amplifying CPU launch overhead
+// in the baseline that launches one kernel per level.
+Graph generate_chain_graph(int num_nodes) {
+    Graph graph;
+    graph.num_nodes = num_nodes;
+    if (num_nodes <= 1) {
+        graph.num_edges = 0;
+        CUDA_CHECK(cudaMalloc(&graph.row_ptr, (num_nodes + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&graph.col_idx, 0));
+        std::vector<int> h_row_ptr(num_nodes + 1, 0);
+        CUDA_CHECK(cudaMemcpy(graph.row_ptr, h_row_ptr.data(),
+                              (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
+        return graph;
+    }
+
+    // Undirected chain: edges (i,i+1) and (i+1,i)
+    int edge_count = 2 * (num_nodes - 1);
+    graph.num_edges = edge_count;
+
+    CUDA_CHECK(cudaMalloc(&graph.row_ptr, (num_nodes + 1) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&graph.col_idx, edge_count * sizeof(int)));
+
+    std::vector<int> h_row_ptr(num_nodes + 1);
+    std::vector<int> h_col_idx(edge_count);
+
+    int idx = 0;
+    for (int i = 0; i < num_nodes; i++) {
+        h_row_ptr[i] = idx;
+        if (i > 0) h_col_idx[idx++] = i - 1;
+        if (i + 1 < num_nodes) h_col_idx[idx++] = i + 1;
+    }
+    h_row_ptr[num_nodes] = idx;
+
+    CUDA_CHECK(cudaMemcpy(graph.row_ptr, h_row_ptr.data(),
+                          (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(graph.col_idx, h_col_idx.data(),
+                          edge_count * sizeof(int), cudaMemcpyHostToDevice));
+    return graph;
+}
+
 void cleanup_graph(Graph graph) {
     cudaFree(graph.row_ptr);
     cudaFree(graph.col_idx);
@@ -301,17 +351,28 @@ int main(int argc, char** argv) {
     int num_nodes = 10000;
     float edge_prob = 0.01f; // Sparse graph
     int source = 0;
+    const char* graph_type = "random"; // "random" or "chain"
     
     if (argc > 1) num_nodes = atoi(argv[1]);
     if (argc > 2) edge_prob = atof(argv[2]);
     if (argc > 3) source = atoi(argv[3]);
+    if (argc > 4) graph_type = argv[4];
     
     printf("Experiment C: Graph BFS Benchmark\n");
-    printf("Graph: %d nodes, edge_prob=%.3f\n", num_nodes, edge_prob);
-    printf("Method,Nodes,Edges,Time_ms,NodesProcessed\n");
+    if (strcmp(graph_type, "chain") == 0) {
+        printf("Graph: %d nodes, type=chain\n", num_nodes);
+    } else {
+        printf("Graph: %d nodes, type=random, edge_prob=%.3f\n", num_nodes, edge_prob);
+    }
+    printf("Method,Nodes,Edges,Time_ms,Extra\n");
     
     // Generate graph
-    Graph graph = generate_random_graph(num_nodes, edge_prob);
+    Graph graph;
+    if (strcmp(graph_type, "chain") == 0) {
+        graph = generate_chain_graph(num_nodes);
+    } else {
+        graph = generate_random_graph(num_nodes, edge_prob);
+    }
     printf("Generated graph with %d edges\n", graph.num_edges);
     
     // Allocate BFS results

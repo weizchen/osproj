@@ -185,7 +185,22 @@ See `RESEARCH_PLAN.md` for:
 - [x] GPU-side slab allocator
 - [x] Experiment A (ping-pong latency)
 - [x] Experiment B (throughput with statistics)
-- [ ] Experiment C (macrobenchmark - Graph BFS)
+- [~] Experiment C (macrobenchmark - Graph BFS prototype; needs validation/tuning)
+
+## Writing the Report / Reproducing Results
+
+The main report lives in `PROJECT.md`. To collect numbers for tables/plots:
+
+```bash
+make clean
+make ARCH=sm_70 main    # or sm_80 for A100, sm_90 for H100
+make test
+./exp_a_pingpong 1000
+./exp_b_throughput 10000 10
+./exp_c_graph_bfs 10000 0.01 0
+```
+
+Each experiment prints CSV-style output that can be pasted into your report tables/plots.
 
 ## Contributing
 

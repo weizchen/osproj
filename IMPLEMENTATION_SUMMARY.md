@@ -77,7 +77,7 @@
 1. **Allocator**: 
    - Maximum allocation size is 4KB (larger needs different approach)
    - Linear search for free blocks (could use free lists)
-   - Single free mask per slab (limits to 32 blocks per slab)
+   - Currently uses a fixed 4KB slab size and a simple bitmap scan (fast to implement, not optimal under contention)
 
 2. **Queue**:
    - Fixed capacity (1024 tasks)

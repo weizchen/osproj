@@ -64,13 +64,22 @@ struct PingPongTaskEnhanced {
     int* data_ptr;
 };
 
-__global__ void grosr_pingpong_runtime(TaskQueue* q, volatile int* stop_flag) {
+// NOTE: This experiment uses a single-producer queue (CPU producer, GPU consumer).
+// To avoid turning it into a multi-producer queue, the GPU runtime executes stage-2
+// immediately after stage-1 (still GPU-driven, no CPU launches), instead of
+// re-enqueuing a second-stage task back into the same queue.
+__global__ void grosr_pingpong_runtime(TaskQueue* q, volatile int* stop_flag, volatile int* start_flag) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid != 0) return;
     
+    // Wait until CPU has finished publishing all stage-1 tasks.
+    while (atomicAdd_system((int*)start_flag, 0) == 0 && *stop_flag == 0) {
+        __nanosleep(1000);
+    }
+
     while (*stop_flag == 0) {
-        int head = atomicAdd(q->head, 0);
-        int tail = atomicAdd(q->tail, 0);
+        int head = atomicAdd_system(q->head, 0);
+        int tail = atomicAdd_system(q->tail, 0);
         
         if (tail >= head) {
             __nanosleep(1000);
@@ -82,18 +91,9 @@ __global__ void grosr_pingpong_runtime(TaskQueue* q, volatile int* stop_flag) {
         if (pop_task(q, &task, sizeof(PingPongTaskEnhanced))) {
             if (task.stage == 0) {
                 process_stage1(task.data_ptr, task.task_id);
-                // Immediately schedule stage 2
-                PingPongTaskEnhanced stage2_task;
-                stage2_task.task_id = task.task_id;
-                stage2_task.stage = 1;
-                stage2_task.data_ptr = task.data_ptr;
-                
-                // Push stage 2 back to queue (simulating GPU-side dispatch)
-                int next_head = atomicAdd(q->head, 1);
-                int slot = next_head % q->capacity;
-                PingPongTaskEnhanced* task_ptr = (PingPongTaskEnhanced*)((char*)q->tasks + (slot * q->task_size));
-                *task_ptr = stage2_task;
-                __threadfence_system();
+                // GPU-driven dependent work: execute stage-2 immediately, without CPU launch.
+                // This keeps the experiment focused on "CPU launches vs persistent GPU control".
+                process_stage2(task.data_ptr, task.task_id);
             } else {
                 process_stage2(task.data_ptr, task.task_id);
             }
@@ -107,19 +107,27 @@ void run_grosr_pingpong(int num_tasks) {
     
     TaskQueue* q;
     CUDA_CHECK(cudaMallocManaged(&q, sizeof(TaskQueue)));
-    init_task_queue(q, 1024, sizeof(PingPongTaskEnhanced));
+    // Only stage-1 tasks are enqueued; stage-2 runs immediately on the GPU.
+    int capacity = num_tasks + 64;
+    if (capacity < 1024) capacity = 1024;
+    init_task_queue(q, capacity, sizeof(PingPongTaskEnhanced));
     
     volatile int* stop_flag;
     CUDA_CHECK(cudaMallocManaged((int**)&stop_flag, sizeof(int)));
     *stop_flag = 0;
+
+    volatile int* start_flag;
+    CUDA_CHECK(cudaMallocManaged((int**)&start_flag, sizeof(int)));
+    *start_flag = 0;
     
     // Launch persistent runtime
-    grosr_pingpong_runtime<<<1, 1>>>(q, stop_flag);
+    grosr_pingpong_runtime<<<1, 1>>>(q, stop_flag, start_flag);
     CUDA_CHECK(cudaGetLastError());
     
     // Warmup
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    cudaDeviceSynchronize();
+    // IMPORTANT: Do not call cudaDeviceSynchronize() here; the runtime kernel is persistent.
+    // Synchronizing the device would wait for the persistent kernel to exit (it won't until stop_flag=1).
     
     auto start = std::chrono::high_resolution_clock::now();
     
@@ -133,9 +141,12 @@ void run_grosr_pingpong(int num_tasks) {
         task.data_ptr = d_data;
         push_task(q, task);
     }
+
+    // Signal GPU runtime that stage-1 production is complete (avoid multi-producer races)
+    __atomic_store_n((int*)start_flag, 1, __ATOMIC_RELEASE);
     
-    // Wait for all tasks to complete (both stages)
-    while (*(volatile int*)q->tail < num_tasks * 2) {
+    // Wait for all tasks to complete
+    while (*(volatile int*)q->tail < num_tasks) {
         std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
     
@@ -152,6 +163,7 @@ void run_grosr_pingpong(int num_tasks) {
     cudaFree(q);
     cudaFree(d_data);
     cudaFree((int*)stop_flag);
+    cudaFree((int*)start_flag);
 }
 
 int main(int argc, char** argv) {

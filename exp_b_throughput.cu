@@ -72,7 +72,11 @@ void run_grosr_throughput(int num_tasks, int num_iterations) {
     
     for (int iter = 0; iter < num_iterations; iter++) {
         TaskQueue q;
-        init_task_queue(&q, 1024, sizeof(SimpleTask));
+        // Avoid producer backpressure dominating the measurement.
+        // Keep a minimum size for small runs, but allow large queues for large N.
+        int capacity = num_tasks + 64;
+        if (capacity < 1024) capacity = 1024;
+        init_task_queue(&q, capacity, sizeof(SimpleTask));
         
         volatile int* stop_flag;
         CUDA_CHECK(cudaMallocManaged((int**)&stop_flag, sizeof(int)));
@@ -85,18 +89,20 @@ void run_grosr_throughput(int num_tasks, int num_iterations) {
         runtime.allocator = nullptr;
         
         // Launch persistent runtime
-        grosr_runtime_kernel<<<1, 1>>>(runtime);
+        // Use a full block so the runtime can process tasks in parallel.
+        grosr_runtime_kernel<<<1, 256>>>(runtime);
         CUDA_CHECK(cudaGetLastError());
         
         // Warmup
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        cudaDeviceSynchronize();
+        // IMPORTANT: Do not call cudaDeviceSynchronize() here; the runtime kernel is persistent.
+        // Synchronizing the device would wait for the persistent kernel to exit (it won't until stop_flag=1).
         
         auto start = std::chrono::high_resolution_clock::now();
         
         // Push all tasks
         for (int i = 0; i < num_tasks; i++) {
-            while (*q.head - *q.tail >= q.capacity) {}
+            while (__atomic_load_n(q.head, __ATOMIC_RELAXED) - __atomic_load_n(q.tail, __ATOMIC_RELAXED) >= q.capacity) {}
             
             SimpleTask task;
             task.task_id = i;

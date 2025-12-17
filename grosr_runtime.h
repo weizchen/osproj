@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstdlib>
 
 // ============================================================================
 // CUDA Error Checking Macro
@@ -64,10 +65,11 @@ struct TaskQueue {
 
 // Slab header: tracks free blocks in a slab
 struct SlabHeader {
-    unsigned int free_mask;  // Bitmask: 1 = free, 0 = allocated
-    int next_free;           // Index of next free block (or -1)
-    int num_blocks;           // Number of blocks in this slab
-    int block_size;           // Size of each block
+    // NOTE: Small size classes (e.g., 32B) have >32 blocks per 4KB slab.
+    // Use a multi-word bitmap so we can represent up to 128 blocks (32B * 128 = 4096B).
+    unsigned int free_mask[4]; // 4 * 32 = 128 bits
+    int num_blocks;            // Number of blocks in this slab
+    int block_size;            // Size of each block
 };
 
 // Slab allocator state
@@ -129,16 +131,18 @@ void cleanup_task_queue(TaskQueue* q);
 template<typename T>
 void push_task(TaskQueue* q, const T& task) {
     // Wait for space (simple backpressure)
-    while (*(volatile int*)q->head - *(volatile int*)q->tail >= q->capacity) {
+    while (__atomic_load_n(q->head, __ATOMIC_RELAXED) - __atomic_load_n(q->tail, __ATOMIC_RELAXED) >= q->capacity) {
         // Yield to avoid busy-waiting
     }
     
-    int slot = (*(volatile int*)q->head) % q->capacity;
+    int head = __atomic_load_n(q->head, __ATOMIC_RELAXED);
+    int slot = head % q->capacity;
     T* task_ptr = (T*)((char*)q->tasks + (slot * q->task_size));
     *task_ptr = task;
     
-    __sync_synchronize(); // Memory barrier
-    *(volatile int*)q->head = *(volatile int*)q->head + 1;
+    // Publish task data before advancing head (release)
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(q->head, head + 1, __ATOMIC_RELAXED);
 }
 
 // GPU: Check queue size
