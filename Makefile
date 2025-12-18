@@ -14,7 +14,7 @@ GROSR_SOURCES = grosr_allocator.cu grosr_queue.cu grosr_runtime.cu
 GROSR_OBJECTS = $(GROSR_SOURCES:.cu=.o)
 
 # Executables (main experiments)
-MAIN_EXECUTABLES = exp_a_pingpong exp_b_throughput exp_c_graph_bfs test_allocator
+MAIN_EXECUTABLES = exp_a_pingpong exp_b_throughput exp_c_graph_bfs exp_d_allocator_bench test_allocator exp_b_plus_fair
 
 # Legacy executables (original demos, kept for reference)
 LEGACY_EXECUTABLES = bench0 exp0 exp1
@@ -62,6 +62,18 @@ exp_b_throughput: exp_b_throughput.cu $(GROSR_OBJECTS)
 exp_c_graph_bfs: exp_c_graph_bfs.cu $(GROSR_OBJECTS)
 	$(NVCC) $(NVCC_FLAGS) $< $(GROSR_OBJECTS) -o $@
 
+# Experiment B+: Fair Throughput
+exp_b_plus_fair: exp_b_plus_fair.cu $(GROSR_OBJECTS)
+	$(NVCC) $(NVCC_FLAGS) $< $(GROSR_OBJECTS) -o $@
+
+# Experiment D: Allocator Microbenchmark
+# Needs separate compilation for device functions (gpu_malloc/gpu_free)
+exp_d_allocator_bench: exp_d_allocator_bench.cu grosr_allocator.cu grosr_queue.o grosr_runtime.o
+	$(NVCC) $(NVCC_FLAGS) -dc exp_d_allocator_bench.cu -o exp_d_allocator_bench.o
+	$(NVCC) $(NVCC_FLAGS) -dc grosr_allocator.cu -o grosr_allocator_dc.o
+	$(NVCC) $(NVCC_FLAGS) exp_d_allocator_bench.o grosr_allocator_dc.o grosr_queue.o grosr_runtime.o -o $@
+	rm -f exp_d_allocator_bench.o grosr_allocator_dc.o
+
 # Test allocator (need separate compilation for device functions)
 test_allocator: test_allocator.cu grosr_allocator.cu grosr_queue.o grosr_runtime.o
 	$(NVCC) $(NVCC_FLAGS) -dc test_allocator.cu -o test_allocator.o
@@ -98,6 +110,7 @@ help:
 	@echo "  exp_a_pingpong   - Experiment A: Ping-Pong Latency"
 	@echo "  exp_b_throughput - Experiment B: Throughput Benchmark"
 	@echo "  exp_c_graph_bfs  - Experiment C: Graph BFS Macrobenchmark"
+	@echo "  exp_d_allocator_bench - Experiment D: Allocator Microbenchmark"
 	@echo "  test_allocator   - Allocator unit tests"
 	@echo ""
 	@echo "Examples:"

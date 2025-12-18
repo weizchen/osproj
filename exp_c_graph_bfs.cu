@@ -10,6 +10,7 @@
 #include <queue>
 #include <algorithm>
 #include <random>
+#include <cstring>
 
 // Graph representation: Compressed Sparse Row (CSR) format
 struct Graph {
@@ -341,10 +342,36 @@ void cleanup_graph(Graph graph) {
     cudaFree(graph.col_idx);
 }
 
+static void init_bfs_result(BFSResult* r, int num_nodes) {
+    CUDA_CHECK(cudaMalloc(&r->distances, num_nodes * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&r->parents, num_nodes * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&r->visited, num_nodes * sizeof(int)));
+    CUDA_CHECK(cudaMemset(r->visited, 0, num_nodes * sizeof(int)));
+    CUDA_CHECK(cudaMemset(r->distances, 0xFF, num_nodes * sizeof(int))); // -1
+    CUDA_CHECK(cudaMemset(r->parents, 0xFF, num_nodes * sizeof(int)));   // -1
+}
+
 void cleanup_bfs_result(BFSResult result, int num_nodes) {
     cudaFree(result.distances);
     cudaFree(result.parents);
     cudaFree(result.visited);
+}
+
+static bool validate_chain_bfs_host(int num_nodes, int source,
+                                    const std::vector<int>& dist,
+                                    const std::vector<int>& parent) {
+    // Deterministic expected BFS tree for undirected chain with source=0:
+    // dist[i] = i, parent[i] = i-1.
+    if (source != 0) return false;
+    if ((int)dist.size() != num_nodes || (int)parent.size() != num_nodes) return false;
+    if (num_nodes <= 0) return true;
+    if (dist[0] != 0) return false;
+    if (parent[0] != -1) return false;
+    for (int i = 1; i < num_nodes; i++) {
+        if (dist[i] != i) return false;
+        if (parent[i] != i - 1) return false;
+    }
+    return true;
 }
 
 int main(int argc, char** argv) {
@@ -377,24 +404,31 @@ int main(int argc, char** argv) {
     
     // Allocate BFS results
     BFSResult baseline_result, grosr_result;
-    CUDA_CHECK(cudaMalloc(&baseline_result.distances, num_nodes * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&baseline_result.parents, num_nodes * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&baseline_result.visited, num_nodes * sizeof(int)));
-    CUDA_CHECK(cudaMemset(baseline_result.visited, 0, num_nodes * sizeof(int)));
-    
-    CUDA_CHECK(cudaMalloc(&grosr_result.distances, num_nodes * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&grosr_result.parents, num_nodes * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&grosr_result.visited, num_nodes * sizeof(int)));
-    CUDA_CHECK(cudaMemset(grosr_result.visited, 0, num_nodes * sizeof(int)));
+    init_bfs_result(&baseline_result, num_nodes);
+    init_bfs_result(&grosr_result, num_nodes);
     
     // Run baseline
     run_baseline_bfs(graph, source, baseline_result);
     
-    // Reset for GROSR
-    CUDA_CHECK(cudaMemset(grosr_result.visited, 0, num_nodes * sizeof(int)));
-    
     // Run GROSR
     run_grosr_bfs(graph, source, grosr_result);
+
+    // Validation (only for chain graphs with source=0; distances/parents are deterministic).
+    if (strcmp(graph_type, "chain") == 0 && source == 0) {
+        std::vector<int> h_base_dist(num_nodes), h_base_parent(num_nodes);
+        std::vector<int> h_grosr_dist(num_nodes), h_grosr_parent(num_nodes);
+
+        CUDA_CHECK(cudaMemcpy(h_base_dist.data(), baseline_result.distances, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_base_parent.data(), baseline_result.parents, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_grosr_dist.data(), grosr_result.distances, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_grosr_parent.data(), grosr_result.parents, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+
+        bool base_ok = validate_chain_bfs_host(num_nodes, source, h_base_dist, h_base_parent);
+        bool grosr_ok = validate_chain_bfs_host(num_nodes, source, h_grosr_dist, h_grosr_parent);
+
+        printf("Baseline_Validate,%s\n", base_ok ? "PASS" : "FAIL");
+        printf("GROSR_Validate,%s\n", grosr_ok ? "PASS" : "FAIL");
+    }
     
     // Cleanup
     cleanup_graph(graph);

@@ -114,6 +114,13 @@ Tests GPU-side slab allocator functionality.
 ./test_allocator
 ```
 
+### Experiment D: Allocator Microbenchmark
+Compares GROSR `gpu_malloc/gpu_free` against CUDA **device-side** `malloc/free`.
+
+```bash
+./exp_d_allocator_bench [num_threads] [iters_per_thread] [size_bytes] [mode] [outstanding] [touch_bytes]
+```
+
 ## Key Components
 
 ### GPU-Side Slab Allocator

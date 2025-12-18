@@ -8,6 +8,13 @@
 #include <algorithm>
 #include <cmath>
 
+__global__ void validate_double_results(const int* results, int n, int* mismatch_count) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid >= n) return;
+    int expected = tid * 2;
+    if (results[tid] != expected) atomicAdd(mismatch_count, 1);
+}
+
 // Baseline: Standard CUDA kernel launches
 __global__ void baseline_task_kernel(int* results, int task_id) {
     results[task_id] = task_id * 2;
@@ -53,6 +60,22 @@ void run_baseline_throughput(int num_tasks, int num_iterations) {
     
     double throughput = (num_tasks * 1000.0) / mean; // Tasks per second
     
+    // Validate correctness outside timing.
+    int* mismatch_count;
+    CUDA_CHECK(cudaMallocManaged(&mismatch_count, sizeof(int)));
+    *mismatch_count = 0;
+    int threads = 256;
+    int blocks = (num_tasks + threads - 1) / threads;
+    validate_double_results<<<blocks, threads>>>(d_results, num_tasks, mismatch_count);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (*mismatch_count == 0) {
+        printf("Baseline_Validate,PASS\n");
+    } else {
+        printf("Baseline_Validate,FAIL,%d_mismatches\n", *mismatch_count);
+    }
+    cudaFree(mismatch_count);
+
     printf("Baseline_Throughput,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f\n",
            num_tasks, mean, median, min_time, max_time, stddev, throughput);
     
@@ -144,6 +167,22 @@ void run_grosr_throughput(int num_tasks, int num_iterations) {
     
     double throughput = (num_tasks * 1000.0) / mean; // Tasks per second
     
+    // Validate correctness outside timing.
+    int* mismatch_count;
+    CUDA_CHECK(cudaMallocManaged(&mismatch_count, sizeof(int)));
+    *mismatch_count = 0;
+    int threads_v = 256;
+    int blocks_v = (num_tasks + threads_v - 1) / threads_v;
+    validate_double_results<<<blocks_v, threads_v>>>(d_results, num_tasks, mismatch_count);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (*mismatch_count == 0) {
+        printf("GROSR_Validate,PASS\n");
+    } else {
+        printf("GROSR_Validate,FAIL,%d_mismatches\n", *mismatch_count);
+    }
+    cudaFree(mismatch_count);
+
     printf("GROSR_Throughput,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f\n",
            num_tasks, mean, median, min_time, max_time, stddev, throughput);
     

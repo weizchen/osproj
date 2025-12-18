@@ -4,6 +4,7 @@
 #include "grosr_runtime.h"
 #include <chrono>
 #include <thread>
+#include <vector>
 
 // Baseline: CPU launches Kernel 1 -> CPU reads X -> CPU launches Kernel 2
 __global__ void kernel1_baseline(int* data, int idx) {
@@ -14,9 +15,19 @@ __global__ void kernel2_baseline(int* data, int idx) {
     data[idx] = data[idx] + 1;
 }
 
+static int validate_pingpong_host(const int* data, int num_tasks) {
+    int mismatches = 0;
+    for (int i = 0; i < num_tasks; i++) {
+        int expected = i * 2 + 1;
+        if (data[i] != expected) mismatches++;
+    }
+    return mismatches;
+}
+
 void run_baseline_pingpong(int num_tasks) {
     int* d_data;
-    CUDA_CHECK(cudaMalloc(&d_data, num_tasks * sizeof(int)));
+    // Use managed memory so we can validate results on the host after the run.
+    CUDA_CHECK(cudaMallocManaged(&d_data, num_tasks * sizeof(int)));
     
     cudaDeviceSynchronize();
     auto start = std::chrono::high_resolution_clock::now();
@@ -34,6 +45,14 @@ void run_baseline_pingpong(int num_tasks) {
     auto end = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(end - start).count();
     double avg_latency_us = (ms * 1000.0) / num_tasks; // Per task pair
+
+    // Validate correctness outside timing.
+    int mismatches = validate_pingpong_host(d_data, num_tasks);
+    if (mismatches == 0) {
+        printf("Baseline_Validate,PASS\n");
+    } else {
+        printf("Baseline_Validate,FAIL,%d_mismatches\n", mismatches);
+    }
     
     printf("Baseline_PingPong,%d,%.3f,%.3f\n", num_tasks, ms, avg_latency_us);
     
@@ -154,6 +173,14 @@ void run_grosr_pingpong(int num_tasks) {
     double ms = std::chrono::duration<double, std::milli>(end - start).count();
     double avg_latency_us = (ms * 1000.0) / num_tasks; // Per task pair
     
+    // Validate correctness outside timing.
+    int mismatches = validate_pingpong_host(d_data, num_tasks);
+    if (mismatches == 0) {
+        printf("GROSR_Validate,PASS\n");
+    } else {
+        printf("GROSR_Validate,FAIL,%d_mismatches\n", mismatches);
+    }
+
     printf("GROSR_PingPong,%d,%.3f,%.3f\n", num_tasks, ms, avg_latency_us);
     
     // Cleanup

@@ -68,6 +68,14 @@ Implementation lives entirely in this repository:
 - **OS/driver**: <version>
 - **Build flags**: `make ARCH=<sm_xx> main`
 
+### Validation methodology (applies to all experiments)
+To ensure baseline and GROSR are computing the same thing (and we are not “benchmarking a bug”), each experiment prints explicit correctness checks outside the timed region:
+
+- **Exp A**: validates `data[i] == 2*i + 1` for all tasks.
+- **Exp B**: validates `results[i] == 2*i` for all tasks (GPU-side mismatch counter).
+- **Exp C (chain graphs)**: validates deterministic BFS outputs (`dist[i]=i`, `parent[i]=i-1` for source=0).
+- **Exp D**: focuses on allocator throughput; correctness is separately validated by `test_allocator`.
+
 ### 6.2 Experiment A: Ping-Pong dispatch latency
 **Question**: How expensive is a dependent “two-stage” operation when driven by CPU kernel launches vs. a GPU-resident scheduler?
 
@@ -115,6 +123,33 @@ Implementation lives entirely in this repository:
 - `make exp_b_throughput`
 - `./exp_b_throughput <num_tasks> <iters>`
 
+#### 6.3.1 Experiment B+ (fair baselines): sync vs batched vs bulk vs GROSR
+The original Exp B baseline (`exp_b_throughput`) is intentionally **worst-case** (launch+sync per task) to expose the “control-plane wall”.
+To provide fairer context, `exp_b_plus_fair` adds additional CPU baselines:
+
+- **Baseline_Sync**: launch one kernel per task and synchronize after every launch (worst-case).
+- **Baseline_Batched**: launch one kernel per task but synchronize only once at the end (removes per-task sync, still pays per-task launch).
+- **Baseline_Bulk**: one kernel computes all results (best-case when tasks are uniform and fusible; represents what you would do if you can avoid “many tiny kernels” entirely).
+- **Baseline_Graphs**: capture the `N` tiny-kernel launch sequence once as a CUDA Graph and replay it (useful when the task DAG is static and repeatable).
+- **GROSR_Throughput**: persistent kernel + queue (GPU-resident control plane).
+
+**Commands**:
+- `make exp_b_plus_fair`
+- `./exp_b_plus_fair <num_tasks> <iters>`
+
+**Results (RTX 3070, CUDA 11.8; 5 iterations)**:
+
+| Tasks (N) | Sync (ops/s) | Batched (ops/s) | Graphs (ops/s) | Bulk (ops/s) | GROSR (ops/s) |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 | 222,265 | 692,023 | 1,207,201 | 149,494,708 | 1,255,771 |
+| 10,000 | 222,263 | 705,856 | 1,224,808 | 1,204,354,947 | 5,806,131 |
+| 50,000 | 218,160 | 778,227 | 1,380,123 | 5,742,901,773 | 16,437,864 |
+
+**Interpretation**:
+- GROSR provides large gains over **Sync** and **Batched** baselines (i.e., when the workload genuinely consists of many small tasks that cannot be fused easily).
+- **Graphs** reduces CPU launch overhead when the kernel DAG is static, but it still replays the same `N` tiny-kernel launches; GROSR can still win by batching and processing tasks inside a persistent kernel.
+- **Bulk** is an important counterpoint: if tasks are uniform and independent, fusing into a single kernel can outperform both GROSR and per-task launches. This helps scope GROSR’s value proposition to *dynamic/irregular/unfusible* workloads where kernel fusion/graphs are not straightforward.
+
 ### 6.4 Experiment C: Graph BFS prototype (macrobenchmark)
 **Question**: Can GPU-side scheduling support irregular, dynamic work creation (neighbors push new tasks) with reduced CPU orchestration?
 
@@ -150,6 +185,49 @@ The chain graph has \(\approx N\) BFS levels, so the baseline performs \(\approx
 - `make test`
 - `./test_allocator`
 
+### 6.6 Experiment D: Allocator microbenchmark
+**Question**: How fast is GROSR’s GPU-side slab allocator compared to CUDA device `malloc/free` for small allocations?
+
+This experiment runs `alloc+touch+free` loops inside a GPU kernel and reports allocation throughput. The benchmark exposes a `touch_bytes` knob: touching more bytes per allocation makes the workload more realistic and typically reduces allocator-dominated speedups (eventually becoming bandwidth-bound).
+
+**Fairness / how to interpret the speedup**: This is a **specialized vs. general-purpose** comparison. GROSR’s allocator is a slab allocator restricted to small sizes (≤4KB) backed by a pre-allocated arena, while CUDA device `malloc/free` is a general-purpose heap designed to handle many cases (with higher metadata/locking overhead). Therefore, large speedups (often \(10^2\times\) in highly concurrent small-allocation workloads) are plausible and do not imply GROSR is universally better. Also note that the benchmark only “touches” a few bytes per allocation to isolate allocator overhead; workloads that heavily initialize/use allocated memory will become more bandwidth/compute-bound and see a smaller end-to-end advantage.
+
+**Results (RTX 3070, CUDA 11.8; 65,536 threads × 50 iters/thread)**:
+
+| Size (bytes) | GROSR allocs/s | Device malloc allocs/s | Speedup (GROSR / Device) |
+|---:|---:|---:|---:|
+| 32 | 582,960,893 | 5,090,305 | 114.5× |
+| 64 | 647,130,589 | 5,429,308 | 119.2× |
+| 256 | 648,183,335 | 3,912,934 | 165.6× |
+| 1024 | 565,071,512 | 1,774,620 | 318.4× |
+
+**Interpretation**: For small allocations, GROSR’s slab allocator is orders of magnitude faster than CUDA’s device `malloc/free`, which is consistent with the design goal (fast, GPU-local small-object allocation). This supports using `gpu_malloc/gpu_free` for dynamic data structures in GPU-resident runtimes.
+
+**More realistic workload modes**: To avoid a “best-case” microbenchmark, `exp_d_allocator_bench` also supports modes with **outstanding allocations** and **mixed size classes** (simulating object lifetimes and size variability).
+Below is one representative setting (RTX 3070, CUDA 11.8; 16,384 threads × 200 iters/thread; base size 64B; outstanding=16):
+
+| Mode | Description | GROSR allocs/s | Device malloc allocs/s | Speedup | GROSR success | Device success |
+|---:|---|---:|---:|---:|---:|---:|
+| 0 | churn (alloc+free immediately) | 283,024,600 | 3,075,601 | 92.0× | 1.0000 | 1.0000 |
+| 1 | outstanding (delayed frees) | 249,571,044 | 1,219,893 | 204.6× | 1.0000 | 1.0000 |
+| 2 | mixed sizes (64–512B mix) | 35,701,885 | 178,597 | 199.9× | 0.9772 | 0.9775 |
+
+**Note**: Mode 2 can exhibit allocation failures because the current slab allocator partitions the arena into fixed per-size-class pools; under skewed or mixed distributions, a size class can run out even if total arena space remains. We report **success rate** to make this behavior explicit.
+
+**Practical takeaway**: Exp D supports the claim that a GPU-resident runtime benefits from a fast small-object allocator, but it also highlights a real limitation (fixed size-class partitioning). A production-quality allocator would add rebalancing between size classes, per-SM caches, and/or fallback paths for large or skewed allocations.
+
+**Commands**:
+- `make exp_d_allocator_bench`
+- `./exp_d_allocator_bench [num_threads] [iters_per_thread] [size_bytes] [mode] [outstanding] [touch_bytes]`
+
+**Speedup range with increased memory touch**: In mode=1 (outstanding allocations), base size 256B, outstanding=16, we observe that increasing `touch_bytes` reduces GROSR’s raw allocation-throughput advantage because the benchmark becomes more dominated by memory writes. For example at 2048 threads × 200 iters:
+
+| TouchBytes | GROSR allocs/s | Device malloc allocs/s | Speedup |
+|---:|---:|---:|---:|
+| 4 | 39,778,112 | 247,131 | 160.9× |
+| 64 | 17,632,019 | 246,953 | 71.4× |
+| 256 | 6,639,741 | 240,487 | 27.6× |
+
 ## 7. Discussion
 ### 7.1 What worked
 - Persistent scheduling + a shared queue is enough to demonstrate CPU control-plane overhead in microbenchmarks.
@@ -160,6 +238,8 @@ The chain graph has \(\approx N\) BFS levels, so the baseline performs \(\approx
 - **Fixed queue capacity**: backpressure via spinning is simple but not ideal.
 - **No preemption**: long-running tasks can starve others.
 - **Not a true OS**: no isolation, interrupts, or syscall execution on the GPU.
+
+**Strong baselines / when GROSR is unnecessary**: If the workload is **static and repeatable**, CUDA **Graphs** can significantly reduce CPU overhead by replaying a captured launch DAG. If tasks are also **uniform and independent**, the best solution is often **kernel fusion / a single bulk kernel** (our “Baseline_Bulk”), which can outperform both GROSR and multi-launch baselines. GROSR is most compelling when the workload is **dynamic, irregular, or data-dependent**, where building a fixed graph or a fused kernel is difficult.
 
 ### 7.3 Future work (credible next steps)
 - Multi-warp scheduler and/or multi-consumer queue
