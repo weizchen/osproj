@@ -14,22 +14,16 @@ GROSR_SOURCES = grosr_allocator.cu grosr_queue.cu grosr_runtime.cu
 GROSR_OBJECTS = $(GROSR_SOURCES:.cu=.o)
 
 # Executables (main experiments)
-MAIN_EXECUTABLES = exp_a_pingpong exp_b_throughput exp_c_graph_bfs exp_d_allocator_bench test_allocator exp_b_plus_fair
+MAIN_EXECUTABLES = exp_a_pingpong exp_b_throughput exp_c_graph_bfs exp_d_allocator_bench exp_e_relu_softmax test_allocator exp_b_plus_fair
 
-# Legacy executables (original demos, kept for reference)
-LEGACY_EXECUTABLES = bench0 exp0 exp1
-
-EXECUTABLES = $(MAIN_EXECUTABLES) $(LEGACY_EXECUTABLES)
+EXECUTABLES = $(MAIN_EXECUTABLES)
 
 .PHONY: all clean test
 
-all: $(MAIN_EXECUTABLES) $(LEGACY_EXECUTABLES)
+all: $(MAIN_EXECUTABLES)
 
 # Build only main experiments (recommended)
 main: $(MAIN_EXECUTABLES)
-
-# Build only legacy demos
-legacy: $(LEGACY_EXECUTABLES)
 
 # Update architecture flag
 NVCC_FLAGS := $(subst sm_70,$(ARCH),$(NVCC_FLAGS))
@@ -37,18 +31,6 @@ NVCC_FLAGS := $(subst sm_70,$(ARCH),$(NVCC_FLAGS))
 # Build GROSR library objects
 %.o: %.cu grosr_runtime.h
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
-
-# Benchmark Experiment 0 (original)
-bench0: benchmark_exp0.cu
-	$(NVCC) $(NVCC_FLAGS) $< -o $@
-
-# Experiment 0: Microkernel (original)
-exp0: exp0_microkernel.cu
-	$(NVCC) $(NVCC_FLAGS) $< -o $@
-
-# Experiment 1: Syscalls (original)
-exp1: exp1_syscalls.cu
-	$(NVCC) $(NVCC_FLAGS) $< -o $@
 
 # Experiment A: Ping-Pong Latency
 exp_a_pingpong: exp_a_pingpong.cu $(GROSR_OBJECTS)
@@ -64,6 +46,10 @@ exp_c_graph_bfs: exp_c_graph_bfs.cu $(GROSR_OBJECTS)
 
 # Experiment B+: Fair Throughput
 exp_b_plus_fair: exp_b_plus_fair.cu $(GROSR_OBJECTS)
+	$(NVCC) $(NVCC_FLAGS) $< $(GROSR_OBJECTS) -o $@
+
+# Experiment E: ReLU + Softmax micro-pipeline
+exp_e_relu_softmax: exp_e_relu_softmax.cu $(GROSR_OBJECTS)
 	$(NVCC) $(NVCC_FLAGS) $< $(GROSR_OBJECTS) -o $@
 
 # Experiment D: Allocator Microbenchmark
@@ -100,8 +86,7 @@ help:
 	@echo ""
 	@echo "Main Targets:"
 	@echo "  main        - Build main experiments (recommended)"
-	@echo "  all         - Build all executables (including legacy)"
-	@echo "  legacy      - Build only legacy demo executables"
+	@echo "  all         - Build all main executables"
 	@echo "  clean       - Remove all build artifacts"
 	@echo "  test        - Run allocator tests"
 	@echo "  benchmark   - Run main benchmarks (exp_a, exp_b)"
@@ -111,6 +96,7 @@ help:
 	@echo "  exp_b_throughput - Experiment B: Throughput Benchmark"
 	@echo "  exp_c_graph_bfs  - Experiment C: Graph BFS Macrobenchmark"
 	@echo "  exp_d_allocator_bench - Experiment D: Allocator Microbenchmark"
+	@echo "  exp_e_relu_softmax    - Experiment E: ReLU+Softmax micro-pipeline"
 	@echo "  test_allocator   - Allocator unit tests"
 	@echo ""
 	@echo "Examples:"
