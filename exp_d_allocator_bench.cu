@@ -225,6 +225,105 @@ __global__ void bench_device_malloc(int iters, int size_bytes, int mode, int out
     out_sum[tid] = local;
 }
 
+// A stronger "realistic" baseline: allocate a per-thread pool once (device malloc),
+// then suballocate/free from it locally (no global heap contention in the hot loop).
+__global__ void bench_thread_pool(int iters, int size_bytes, int mode, int outstanding, int touch_bytes, int* out_sum) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int local = 0;
+
+    int max_req_size = size_bytes;
+    if (mode == 2) {
+        long long s = (long long)size_bytes * 8LL;
+        if (s > 4096LL) s = 4096LL;
+        if (s < 1LL) s = 1LL;
+        max_req_size = (int)s;
+    }
+
+    int slots = (mode == 0) ? 1 : outstanding;
+    if (slots <= 0) slots = 1;
+    if (slots > 64) slots = 64;
+
+    size_t pool_bytes = (size_t)slots * (size_t)max_req_size;
+    unsigned char* pool = (unsigned char*)malloc(pool_bytes);
+    if (!pool) {
+        // If the one-time pool allocation fails, count all ops as failures.
+        out_sum[tid] = -iters;
+        return;
+    }
+
+    // Local free list of slots (stack).
+    int free_top = slots;
+    int free_idx[64];
+    for (int i = 0; i < slots; i++) free_idx[i] = i;
+
+    // Churn: repeatedly take slot 0 and return it.
+    // Outstanding/mixed: maintain a pool of live allocations per thread.
+    void* live[64];
+    for (int i = 0; i < slots; i++) live[i] = nullptr;
+
+    // Initialize live set for modes 1/2
+    if (mode != 0) {
+        for (int i = 0; i < slots; i++) {
+            int s = size_bytes;
+            if (mode == 2) {
+                int mult = 1 << ((tid + i) & 3);
+                s = size_bytes * mult;
+                if (s > 4096) s = 4096;
+            }
+            if (free_top <= 0) break;
+            int slot = free_idx[--free_top];
+            unsigned char* p = pool + (size_t)slot * (size_t)max_req_size;
+            touch_memory_bytes(p, (size_t)s, tid ^ (i * 7334147), touch_bytes);
+            live[i] = p;
+        }
+    }
+
+    for (int i = 0; i < iters; i++) {
+        // free one live slot (if any)
+        if (mode != 0) {
+            int which = (tid + i) % slots;
+            if (live[which]) {
+                size_t off = (size_t)((unsigned char*)live[which] - pool);
+                int slot = (int)(off / (size_t)max_req_size);
+                if (free_top < 64) free_idx[free_top++] = slot;
+                live[which] = nullptr;
+            }
+        }
+
+        // allocate a slot from local free list
+        if (free_top <= 0) {
+            local -= 1;
+            continue;
+        }
+        int slot = free_idx[--free_top];
+        unsigned char* p = pool + (size_t)slot * (size_t)max_req_size;
+
+        int s = size_bytes;
+        if (mode == 2) {
+            int mult = 1 << ((tid + i) & 3);
+            s = size_bytes * mult;
+            if (s > 4096) s = 4096;
+        }
+        touch_memory_bytes(p, (size_t)s, tid ^ (i * 2654435761U), touch_bytes);
+
+        // free or keep outstanding
+        if (mode == 0) {
+            if (free_top < 64) free_idx[free_top++] = slot;
+        } else {
+            int which = (tid + i) % slots;
+            live[which] = p;
+        }
+        local += 1;
+    }
+
+    // One-time cleanup. (Not timed differently; included in kernel time for this baseline.)
+    for (int i = 0; i < slots; i++) {
+        if (live[i]) live[i] = nullptr;
+    }
+    free(pool);
+    out_sum[tid] = local;
+}
+
 static void run_one(const char* name,
                     void (*launch)(int blocks, int threads, int iters, int size_bytes, int mode, int outstanding, int touch_bytes, int* out_sum, SlabAllocator* alloc),
                     int blocks, int threads, int iters, int size_bytes, int mode, int outstanding, int touch_bytes, int* out_sum, SlabAllocator* alloc,
@@ -285,6 +384,11 @@ static void launch_dev_malloc(int blocks, int threads, int iters, int size_bytes
     CUDA_CHECK(cudaGetLastError());
 }
 
+static void launch_thread_pool(int blocks, int threads, int iters, int size_bytes, int mode, int outstanding, int touch_bytes, int* out_sum, SlabAllocator* /*alloc*/) {
+    bench_thread_pool<<<blocks, threads>>>(iters, size_bytes, mode, outstanding, touch_bytes, out_sum);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 int main(int argc, char** argv) {
     int num_threads = 65536;     // total threads
     int iters = 100;             // per thread
@@ -311,11 +415,19 @@ int main(int argc, char** argv) {
     int blocks = (num_threads + threads - 1) / threads;
 
     // Device malloc/free needs a heap. Make it large enough for concurrency.
-    // Worst case outstanding allocations is roughly num_threads if malloc/free is slow.
-    // We set something generous but not insane.
     // For modes with outstanding allocations, provision heap proportional to outstanding.
+    //
+    // IMPORTANT (fairness for Mode 2): mixed-size mode allocates up to 8× the base size,
+    // so size the heap using the maximum requested allocation size rather than size_bytes.
     int eff_out = (mode == 0) ? 2 : (outstanding + 2);
-    size_t heap_bytes = (size_t)num_threads * (size_t)size_bytes * (size_t)eff_out;
+    int max_req_size = size_bytes;
+    if (mode == 2) {
+        long long s = (long long)size_bytes * 8LL;
+        if (s > 4096LL) s = 4096LL;
+        if (s < 1LL) s = 1LL;
+        max_req_size = (int)s;
+    }
+    size_t heap_bytes = (size_t)num_threads * (size_t)max_req_size * (size_t)eff_out;
     if (heap_bytes < (size_t)64 * 1024 * 1024) heap_bytes = (size_t)64 * 1024 * 1024;
     CUDA_CHECK(cudaDeviceSetLimit(cudaLimitMallocHeapSize, heap_bytes));
 
@@ -331,11 +443,15 @@ int main(int argc, char** argv) {
     float ms_grosr = 0.0f, ms_dev = 0.0f;
     long long grosr_success = 0, grosr_fail = 0;
     long long dev_success = 0, dev_fail = 0;
+    float ms_pool = 0.0f;
+    long long pool_success = 0, pool_fail = 0;
     run_one("GROSR", launch_grosr, blocks, threads, iters, size_bytes, mode, outstanding, touch_bytes, out_sum, alloc, &ms_grosr, &grosr_success, &grosr_fail);
     run_one("DeviceMalloc", launch_dev_malloc, blocks, threads, iters, size_bytes, mode, outstanding, touch_bytes, out_sum, nullptr, &ms_dev, &dev_success, &dev_fail);
+    run_one("ThreadPool", launch_thread_pool, blocks, threads, iters, size_bytes, mode, outstanding, touch_bytes, out_sum, nullptr, &ms_pool, &pool_success, &pool_fail);
 
     double grosr_ops_sec = (double)grosr_success / (ms_grosr / 1000.0);
     double dev_ops_sec = (double)dev_success / (ms_dev / 1000.0);
+    double pool_ops_sec = (double)pool_success / (ms_pool / 1000.0);
 
     printf("Experiment D: Allocator Microbenchmark\n");
     printf("ThreadsTotal=%d, ItersPerThread=%d, SizeBytes=%d, Mode=%d, Outstanding=%d, TouchBytes=%d\n",
@@ -344,10 +460,13 @@ int main(int argc, char** argv) {
     double total_ops = (double)blocks * (double)threads * (double)iters;
     double grosr_sr = (total_ops > 0) ? ((double)grosr_success / total_ops) : 0.0;
     double dev_sr = (total_ops > 0) ? ((double)dev_success / total_ops) : 0.0;
+    double pool_sr = (total_ops > 0) ? ((double)pool_success / total_ops) : 0.0;
     printf("GROSR_Alloc,%d,%d,%d,%d,%d,%d,%.3f,%.0f,%.4f\n",
            blocks * threads, iters, size_bytes, mode, outstanding, touch_bytes, ms_grosr, grosr_ops_sec, grosr_sr);
     printf("Device_Malloc,%d,%d,%d,%d,%d,%d,%.3f,%.0f,%.4f\n",
            blocks * threads, iters, size_bytes, mode, outstanding, touch_bytes, ms_dev, dev_ops_sec, dev_sr);
+    printf("ThreadPool_Suballoc,%d,%d,%d,%d,%d,%d,%.3f,%.0f,%.4f\n",
+           blocks * threads, iters, size_bytes, mode, outstanding, touch_bytes, ms_pool, pool_ops_sec, pool_sr);
 
     cleanup_slab_allocator(alloc);
     cudaFree(alloc);
